@@ -8,6 +8,12 @@ from torch.distributed.checkpoint.state_dict import _get_fqns as get_fqns
 from torch.distributed.tensor import DTensor
 
 from hud.rl.utils import is_main_process
+from hud.rl.lora import (
+    has_lora_layers,
+    merge_lora_weights_inplace,
+    restore_lora_weights_inplace,
+    clean_lora_state_dict,
+)
 from hud.rl.logger import console
 
 
@@ -30,24 +36,43 @@ class CheckpointManager:
         return self.output_dir / f"step_{step:05d}" / "checkpoints"
 
     def _gather_weights(self, model: nn.Module) -> dict[str, Tensor]:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed")
-            warnings.filterwarnings("ignore", category=UserWarning, module="torch.distributed.*")
+        """Gather a CPU state dict suitable for HF/vLLM.
 
-            cpu_state = {}
-            for key, value in model.state_dict().items():
-                if isinstance(value, DTensor):
-                    # Gather full tensor from all ranks
-                    value = value.full_tensor()
+        - If LoRA layers are present, temporarily merge deltas into base weights
+          to produce vanilla weights, then restore.
+        - Remove LoRA-specific tensors and `.base_layer.` keys for compatibility.
+        """
+        original_lora_state: dict[str, dict[str, Tensor]] | None = None
+        lora_present = has_lora_layers(model)
+        if lora_present:
+            original_lora_state = merge_lora_weights_inplace(model)
 
-                if self._is_master:
-                    # Get fully qualified name for HF compatibility
-                    fqn = get_fqns(model, key)
-                    assert len(fqn) == 1
-                    fqn = next(iter(fqn))
-                    cpu_state[fqn] = value.to("cpu", non_blocking=False)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed")
+                warnings.filterwarnings("ignore", category=UserWarning, module="torch.distributed.*")
 
-            torch.distributed.barrier()
+                cpu_state: dict[str, Tensor] = {}
+                for key, value in model.state_dict().items():
+                    if isinstance(value, DTensor):
+                        # Gather full tensor from all ranks
+                        value = value.full_tensor()
+
+                    if self._is_master:
+                        # Get fully qualified name for HF compatibility
+                        fqn = get_fqns(model, key)
+                        assert len(fqn) == 1
+                        fqn = next(iter(fqn))
+                        cpu_state[fqn] = value.to("cpu", non_blocking=False)
+
+                torch.distributed.barrier()
+        finally:
+            if original_lora_state is not None:
+                restore_lora_weights_inplace(model, original_lora_state)
+
+        # Clean for HF/vLLM compatibility (drop lora_* and .base_layer.)
+        if any("lora_A" in k or "lora_B" in k or ".base_layer." in k for k in cpu_state.keys()):
+            cpu_state = clean_lora_state_dict(cpu_state)
 
         return cpu_state
 

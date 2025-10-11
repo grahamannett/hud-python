@@ -118,6 +118,36 @@ class ModelConfig(BaseConfig):
         description="Whether to freeze the vision tower parameters during training"
     )
 
+    # LoRA configuration
+    enable_lora: bool = Field(
+        default=False,
+        description="Enable LoRA adapters for efficient fine-tuning",
+    )
+    lora_r: int = Field(
+        default=0,
+        ge=0,
+        description="LoRA rank (r). Set >0 or enable_lora=True to activate LoRA",
+    )
+    lora_alpha: int = Field(default=16, ge=0, description="LoRA alpha scaling factor")
+    lora_dropout: float = Field(default=0.0, ge=0.0, le=1.0, description="LoRA dropout")
+    lora_target_modules: list[str] = Field(
+        default_factory=lambda: [
+            # Qwen/Qwen2.5 typical module names
+            r".*self_attn\.q_proj$",
+            r".*self_attn\.k_proj$",
+            r".*self_attn\.v_proj$",
+            r".*self_attn\.o_proj$",
+            r".*mlp\.gate_proj$",
+            r".*mlp\.up_proj$",
+            r".*mlp\.down_proj$",
+        ],
+        description="Regex patterns for modules to LoRA-ize (matched against named_modules keys)",
+    )
+    lora_modules_to_save: list[str] = Field(
+        default_factory=list,
+        description="Regex patterns for modules to keep fully trainable in addition to LoRA",
+    )
+
     @model_validator(mode='after')
     def validate_dependencies(self) -> 'ModelConfig':
         if self.attn_implementation == "flash_attention_2":

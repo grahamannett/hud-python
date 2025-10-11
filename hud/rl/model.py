@@ -20,6 +20,7 @@ from hud.rl.logger import console
 from hud.rl.config import ModelConfig, ProcessorConfig, TrainingConfig
 from hud.rl.parallel_dims import ParallelDims
 from hud.rl.parallelize import apply_fsdp
+from hud.rl.lora import apply_lora_to_model
 
 def freeze_vision_tower(model: nn.Module) -> None:
     for name, module in model.named_modules():
@@ -58,6 +59,23 @@ def get_model(config: ModelConfig) -> nn.Module:
 
     if config.freeze_vision_tower:
         freeze_vision_tower(model)
+
+    # Apply LoRA adapters before FSDP if enabled
+    try:
+        if getattr(config, "enable_lora", False) or (getattr(config, "lora_r", 0) or 0) > 0:
+            r = int(getattr(config, "lora_r", 0))
+            if r <= 0:
+                r = 8  # minimal default if enable_lora=True without r
+            apply_lora_to_model(
+                model,
+                rank=r,
+                alpha=float(getattr(config, "lora_alpha", 16)),
+                dropout=float(getattr(config, "lora_dropout", 0.0)),
+                target_modules=list(getattr(config, "lora_target_modules", []) or []),
+                modules_to_save=list(getattr(config, "lora_modules_to_save", []) or []),
+            )
+    except Exception as e:
+        console.warning(f"Failed to apply LoRA: {e}")
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
