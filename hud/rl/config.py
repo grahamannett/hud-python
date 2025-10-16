@@ -179,6 +179,8 @@ class TrainingConfig(BaseConfig):
     dp_replicate: int = Field(default=1, ge=1, description="Data parallel replicate.")
     dp_shard: int = Field(default=1, ge=1, description="Data parallel shard.")
 
+    profile: bool = Field(default=False, description="Whether to profile the training")
+
     # Checkpointing
     output_dir: str = ""
     save_last_n: int = Field(default=1, ge=1, description="Save last N checkpoints")

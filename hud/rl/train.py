@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import contextlib
-import json
 import os
 import time
 from pathlib import Path
- 
-
-from torch.distributed import get_rank
-
-# Disable tokenizer parallelism warnings
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
+from contextlib import nullcontext
+import pickle
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from hud.rl.config import Config, TrainingConfig
 from hud.rl.logger import console
@@ -22,7 +15,7 @@ from hud.rl.metrics import MetricsCollector
 from hud.rl.model import build_model
 from hud.rl.optimizer import get_optimizer
 from hud.rl.parallel_dims import ParallelDims
-from hud.rl.utils import get_world_size, setup_distributed, is_main_process
+from hud.rl.utils import get_world_size, setup_distributed, is_main_process, get_rank
 from hud.rl.checkpoint import CheckpointManager
 from hud.rl.utils import save_step_metrics
 from hud.rl.types import TrainingSample
@@ -31,7 +24,7 @@ from hud.rl.types import TrainingSample
 def get_batch(step: int, root: str) -> list[TrainingSample]:
     """Load the batch for the given step from ``<output_dir>/step_{step}/rollouts``."""
 
-    rank = int(os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or 0)
+    rank = get_rank()
     output_root = Path(root)
     step_rollout_dir = output_root / f"step_{step:05d}" / "rollouts"
     batch_path = step_rollout_dir / f"rank_{rank}.pt"
@@ -44,19 +37,18 @@ def get_batch(step: int, root: str) -> list[TrainingSample]:
     return torch.load(batch_path, weights_only=False)
 
 def train(
-    training_config: TrainingConfig,
+    config: TrainingConfig,
     max_steps: int,
 ) -> None:
 
     setup_distributed()
     world_size = get_world_size()
-    rank = get_rank()
 
     console.section_title("Initializing trainer")
 
     parallel_dims = ParallelDims(
-        dp_replicate=training_config.dp_replicate,
-        dp_shard=training_config.dp_shard,
+        dp_replicate=config.dp_replicate,
+        dp_shard=config.dp_shard,
         cp=1,
         tp=1,
         pp=1,
@@ -65,31 +57,40 @@ def train(
         world_size=world_size,
     )
 
-    model = build_model(training_config, parallel_dims)
+    model = build_model(config, parallel_dims)
 
     ref_model: torch.nn.Module | None = None
-    if training_config.loss.kl_beta > 0:
+    if config.loss.kl_beta > 0:
         console.info("Initializing reference model for KL regularization")
-        ref_model = build_model(training_config, parallel_dims)
+        ref_model = build_model(config, parallel_dims)
         ref_model.eval()
 
-    optimizer = get_optimizer(training_config.optimizer, model)
+    optimizer = get_optimizer(config.optimizer, model)
 
     checkpoint_manager = CheckpointManager(
-        output_dir=training_config.output_dir,
-        save_last_n=training_config.save_last_n,
+        output_dir=config.output_dir,
+        save_last_n=config.save_last_n,
     )
 
     collector = MetricsCollector(distributed=(world_size > 1))
 
+    record_function_ctx = nullcontext
+    if config.profile:
+        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True).__enter__()
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+        record_function_ctx = record_function
+
     for step in range(max_steps):
+
+        torch.cuda.reset_peak_memory_stats()
+
         collector.reset()
         # Save checkpoint from previous step (skip first step since no training yet)
         if step > 0:
             console.info(f"Saving checkpoint for step {step - 1}...")
             checkpoint_manager.save(model, step - 1)
         
-        batch = get_batch(step, training_config.output_dir)
+        batch = get_batch(step, config.output_dir)
                 
         if ref_model is not None:
             with console.progress("Computing reference log probabilities...") as progress, torch.no_grad():
@@ -112,7 +113,8 @@ def train(
         with console.progress("Computing old log probabilities...") as progress, torch.no_grad():
             for i, minibatch in enumerate(batch):
                 sample = minibatch.to_device(torch.device("cuda"))
-                logits = model(**sample.inputs).logits
+                with record_function_ctx("recompute_forward"):
+                    logits = model(**sample.inputs).logits
                 logits = torch.cat(
                     [torch.zeros_like(logits[:, :1, :]), logits[:, :-1, :]], dim=1
                 )
@@ -129,11 +131,11 @@ def train(
         model.train()
         training_start_time = time.time()
 
-        if training_config.loss.importance_sampling_level == "token":
+        if config.loss.importance_sampling_level == "token":
             loss_norm = int(sum(
                 minibatch.inputs["assistant_mask"].sum().item() for minibatch in batch
             ))
-        elif training_config.loss.importance_sampling_level == "sequence":
+        elif config.loss.importance_sampling_level == "sequence":
             loss_norm = len(batch)
 
         with console.progress("Training...") as progress:
@@ -141,7 +143,8 @@ def train(
                 model.set_requires_all_reduce(idx == len(batch) - 1)
 
                 sample = minibatch.to_device(torch.device("cuda"))
-                logits = model(**sample.inputs).logits
+                with record_function_ctx("recompute_forward"):
+                    logits = model(**sample.inputs).logits
                 logits = torch.cat(
                     [torch.zeros_like(logits[:, :1, :]), logits[:, :-1, :]], dim=1
                 )
@@ -167,7 +170,7 @@ def train(
                     sample.ref_logprobs,
                     sample.advantage,
                     sample.inputs["assistant_mask"],
-                    training_config.loss,
+                    config.loss,
                     loss_norm,
                 )
 
@@ -179,11 +182,12 @@ def train(
                         collector.log(**{name: tensor[mask]})
                 
                 del logits
-                loss.backward()
+                with record_function_ctx("backward"):
+                    loss.backward()
                 progress.update(f"Trained... {idx + 1}/{len(batch)}")
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), training_config.max_grad_norm
+            model.parameters(), config.max_grad_norm
         )
         collector.log(grad_norm=grad_norm.detach())
 
@@ -195,7 +199,15 @@ def train(
 
         stats = collector.get_stats()
         if is_main_process():
-            save_step_metrics(training_config.output_dir, step, stats)
+            save_step_metrics(config.output_dir, step, stats)
+
+        if config.profile:
+            memory_path = Path(config.output_dir) / f"step_{step:05d}" / f"memory_{get_rank()}.pickle"
+            with open(memory_path, "wb") as f:
+                pickle.dump(torch.cuda.memory._snapshot(), f)
+
+            prof.__exit__(None, None, None) 
+            prof.export_chrome_trace(Path(config.output_dir) / f"step_{step:05d}" / f"trace_{get_rank()}.json.gz")
         
         
         torch.cuda.empty_cache()

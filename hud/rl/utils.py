@@ -37,9 +37,10 @@ def setup_distributed() -> None:
 
 
 def get_world_size() -> int:
-    """Return expected world size from env, defaulting to 1."""
     return int(os.environ.get("WORLD_SIZE", "1"))
 
+def get_rank() -> int:
+    return int(os.environ.get("RANK", "0"))
 
 def cleanup_distributed() -> None:
     if dist.is_initialized():
